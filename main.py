@@ -21,6 +21,7 @@ class Config:
     skip_extensions: list[str] | None = None
     dry_run: bool = False
     workers: int | None = None
+    debug: bool = False
 
     def __post_init__(self):
         """Normalize paths and skip extensions."""
@@ -39,11 +40,9 @@ class Config:
 
 # Global config instance
 config: Config | None = None
-# Global debug flag
-debug: bool = False
 
 
-@dataclass
+@dataclass(slots=True, frozen=True)
 class FileToProcess:
     """Dataclass representing a file to be hardlinked."""
 
@@ -52,7 +51,9 @@ class FileToProcess:
     rel_path: Path
 
 
-def _process_file(file_info: FileToProcess, dry_run: bool, verbose: bool) -> int:
+def _process_file(
+    file_info: FileToProcess, dry_run: bool, verbose: bool, debug: bool
+) -> int:
     """Helper function to process a single file for parallel execution."""
     try:
         if not dry_run:
@@ -100,6 +101,9 @@ def hardlink_copy_recursive(cfg: Config) -> int:
 
             # Skip files with extensions in skip list
             if src_path.suffix in cfg.skip_extensions:
+                if cfg.verbose:
+                    rel_path = src_path.relative_to(src_dir)
+                    logger.info(f"Skipped (extension filtered): {rel_path}")
                 continue
 
             # Calculate relative path from source root
@@ -132,7 +136,7 @@ def hardlink_copy_recursive(cfg: Config) -> int:
     file_count = 0
     if files_to_process:
         process_worker = partial(
-            _process_file, dry_run=cfg.dry_run, verbose=cfg.verbose
+            _process_file, dry_run=cfg.dry_run, verbose=cfg.verbose, debug=cfg.debug
         )
         with Pool(processes=cfg.workers) as pool:
             results = pool.map(process_worker, files_to_process)
@@ -142,7 +146,7 @@ def hardlink_copy_recursive(cfg: Config) -> int:
 
 
 def main():
-    global config, debug
+    global config
 
     parser = argparse.ArgumentParser(
         description="Recursively hardlink copy all files from one or more source directories to a destination, preserving paths."
@@ -181,9 +185,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Set debug flag
-    debug = args.debug
-
     # Configure logging based on verbose or debug flag
     log_level = logging.DEBUG if (args.verbose or args.debug) else logging.INFO
     log_format = (
@@ -204,19 +205,20 @@ def main():
         skip_extensions=args.skip_extensions,
         dry_run=args.dry_run,
         workers=args.workers,
+        debug=args.debug,
     )
 
     try:
         file_count = hardlink_copy_recursive(config)
         logger.info(f"Successfully hardlinked {file_count} files")
     except ValueError as e:
-        if debug:
+        if config.debug:
             logger.exception(f"Error: {e}")
         else:
             logger.error(f"Error: {e}")
         sys.exit(1)
     except Exception as e:
-        if debug:
+        if config.debug:
             logger.exception(f"Unexpected error: {e}")
         else:
             logger.error(f"Unexpected error: {e}")

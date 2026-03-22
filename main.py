@@ -200,7 +200,7 @@ def main():
     config = Config(
         sources=args.sources,
         destination=args.destination,
-        verbose=args.verbose,
+        verbose=args.verbose or args.debug,
         skip_extensions=args.skip_extensions,
         dry_run=args.dry_run,
         workers=args.workers,

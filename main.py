@@ -3,9 +3,9 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from multiprocessing import Pool
-from dataclasses import dataclass
-from functools import partial
+from multiprocessing import Queue, Process, Value
+from dataclasses import dataclass, field
+from ctypes import c_int
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ class Config:
     sources: list[Path]
     destination: Path
     verbose: bool = False
-    skip_extensions: list[str] | None = None
+    skip_extensions: list[str] = field(default_factory=list)
     dry_run: bool = False
     workers: int | None = None
     debug: bool = False
@@ -29,8 +29,6 @@ class Config:
         normalized_sources = [Path(src).resolve() for src in self.sources]
         object.__setattr__(self, "sources", normalized_sources)
         object.__setattr__(self, "destination", Path(self.destination).resolve())
-        if self.skip_extensions is None:
-            object.__setattr__(self, "skip_extensions", [])
         # Ensure extensions start with a dot
         skip_exts = [
             ext if ext.startswith(".") else f".{ext}" for ext in self.skip_extensions
@@ -56,6 +54,9 @@ def _process_file(
 ) -> int:
     """Helper function to process a single file for parallel execution."""
     try:
+        # Ensure parent directory exists
+        file_info.dst_path.parent.mkdir(parents=True, exist_ok=True)
+
         if not dry_run:
             os.link(file_info.src_path, file_info.dst_path)
         if verbose:
@@ -69,8 +70,80 @@ def _process_file(
         return 0
 
 
+def _producer(
+    src_dir: Path,
+    skip_extensions: list[str],
+    destination: Path,
+    verbose: bool,
+    queue: "Queue[FileToProcess]",
+) -> None:
+    """Producer: Scans a source directory and enqueues files to process."""
+    for src_path in src_dir.rglob("*"):
+        # Skip directories
+        if src_path.is_dir():
+            continue
+
+        # Skip files that are under the destination directory
+        try:
+            src_path.relative_to(destination)
+            if verbose:
+                rel_path = src_path.relative_to(src_dir)
+                logger.info(f"Skipped (in destination): {rel_path}")
+            continue
+        except ValueError:
+            # File is not under destination, proceed normally
+            pass
+
+        # Skip files with extensions in skip list
+        if src_path.suffix in skip_extensions:
+            if verbose:
+                rel_path = src_path.relative_to(src_dir)
+                logger.info(f"Skipped (extension filtered): {rel_path}")
+            continue
+
+        # Calculate relative path from source root
+        rel_path = src_path.relative_to(src_dir)
+        dst_path = destination / rel_path
+
+        # Skip if destination file already exists
+        if dst_path.exists() or dst_path.is_symlink():
+            if verbose:
+                logger.info(f"Skipped (already exists): {rel_path}")
+            continue
+
+        # Enqueue the file for processing
+        queue.put(
+            FileToProcess(
+                src_path=src_path,
+                dst_path=dst_path,
+                rel_path=rel_path,
+            )
+        )
+
+
+def _consumer(
+    queue: "Queue[FileToProcess | None]",
+    dry_run: bool,
+    verbose: bool,
+    debug: bool,
+    file_count,
+) -> None:
+    """Consumer: Dequeues files and hardlinks them. Updates shared file_count."""
+    while True:
+        file_info = queue.get()
+        if file_info is None:  # Sentinel value indicating end of work
+            break
+        result = _process_file(file_info, dry_run, verbose, debug)
+        if result == 1:
+            with file_count.get_lock():
+                file_count.value += 1
+
+
 def hardlink_copy_recursive(cfg: Config) -> int:
     """Hardlink copy all files from src directories to dst, preserving directory structure.
+
+    Uses a producer-consumer pattern where producers scan source directories
+    and enqueue files, while consumers process and hardlink them.
 
     Args:
         cfg: Config object containing all operation parameters
@@ -89,60 +162,65 @@ def hardlink_copy_recursive(cfg: Config) -> int:
     if not cfg.dry_run:
         cfg.destination.mkdir(parents=True, exist_ok=True)
 
-    # Collect all files to process from all sources
-    files_to_process = []
-    parent_dirs = set()
+    # Create a queue for producer-consumer communication
+    queue: "Queue[FileToProcess | None]" = Queue()
 
+    # Create a shared counter for tracking processed files
+    file_count = Value(c_int, 0)
+
+    # Start producer processes (one per source directory)
+    producer_processes: list[Process] = []
     for src_dir in cfg.sources:
-        for src_path in src_dir.rglob("*"):
-            # Skip directories
-            if src_path.is_dir():
-                continue
-
-            # Skip files with extensions in skip list
-            if src_path.suffix in cfg.skip_extensions:
-                if cfg.verbose:
-                    rel_path = src_path.relative_to(src_dir)
-                    logger.info(f"Skipped (extension filtered): {rel_path}")
-                continue
-
-            # Calculate relative path from source root
-            rel_path = src_path.relative_to(src_dir)
-            dst_path = cfg.destination / rel_path
-
-            # Track parent directories that need to be created
-            parent_dirs.add(dst_path.parent)
-
-            # Skip if destination file already exists
-            if dst_path.exists() or dst_path.is_symlink():
-                if cfg.verbose:
-                    logger.info(f"Skipped (already exists): {rel_path}")
-                continue
-
-            files_to_process.append(
-                FileToProcess(
-                    src_path=src_path,
-                    dst_path=dst_path,
-                    rel_path=rel_path,
-                )
-            )
-
-    # Create all parent directories sequentially
-    if not cfg.dry_run:
-        for parent_dir in sorted(parent_dirs):
-            parent_dir.mkdir(parents=True, exist_ok=True)
-
-    # Process files in parallel
-    file_count = 0
-    if files_to_process:
-        process_worker = partial(
-            _process_file, dry_run=cfg.dry_run, verbose=cfg.verbose, debug=cfg.debug
+        p = Process(
+            target=_producer,
+            args=(
+                src_dir,
+                cfg.skip_extensions,
+                cfg.destination,
+                cfg.verbose,
+                queue,
+            ),
         )
-        with Pool(processes=cfg.workers) as pool:
-            results = pool.map(process_worker, files_to_process)
-            file_count = sum(results)
+        p.start()
+        producer_processes.append(p)
 
-    return file_count
+    # Determine number of consumer processes (half available workers or at least 1)
+    num_consumers = max(1, (cfg.workers or 1) // 2)
+
+    # Start consumer processes
+    consumer_processes: list[Process] = []
+    for _ in range(num_consumers):
+        p = Process(
+            target=_consumer_wrapper,
+            args=(queue, cfg.dry_run, cfg.verbose, cfg.debug, file_count),
+        )
+        p.start()
+        consumer_processes.append(p)
+
+    # Wait for all producers to finish
+    for p in producer_processes:
+        p.join()
+
+    # Send sentinel values to signal consumers to stop
+    for _ in range(num_consumers):
+        queue.put(None)
+
+    # Wait for all consumers to finish
+    for p in consumer_processes:
+        p.join()
+
+    return file_count.value
+
+
+def _consumer_wrapper(
+    queue: "Queue[FileToProcess | None]",
+    dry_run: bool,
+    verbose: bool,
+    debug: bool,
+    file_count,
+) -> None:
+    """Wrapper function for consumer process to handle queue communication."""
+    _consumer(queue, dry_run, verbose, debug, file_count)
 
 
 def main():

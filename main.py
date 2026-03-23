@@ -4,6 +4,7 @@ import argparse
 import logging
 from pathlib import Path
 from multiprocessing import Queue, Process, Value
+
 from dataclasses import dataclass, field
 from ctypes import c_int
 
@@ -20,7 +21,7 @@ class Config:
     verbose: bool = False
     skip_extensions: list[str] = field(default_factory=list)
     dry_run: bool = False
-    workers: int | None = None
+    workers: int = 1
     debug: bool = False
 
     def __post_init__(self):
@@ -54,10 +55,9 @@ def _process_file(
 ) -> int:
     """Helper function to process a single file for parallel execution."""
     try:
-        # Ensure parent directory exists
-        file_info.dst_path.parent.mkdir(parents=True, exist_ok=True)
-
         if not dry_run:
+            # Ensure parent directory exists
+            file_info.dst_path.parent.mkdir(parents=True, exist_ok=True)
             os.link(file_info.src_path, file_info.dst_path)
         if verbose:
             logger.info(f"Hardlinked: {file_info.rel_path}")
@@ -71,54 +71,68 @@ def _process_file(
 
 
 def _producer(
-    src_dir: Path,
+    src_dir_queue: "Queue[SourceDirectory]",
+    dirs_left_to_scan: Value,  # type: ignore
     skip_extensions: list[str],
     destination: Path,
     verbose: bool,
     queue: "Queue[FileToProcess]",
 ) -> None:
     """Producer: Scans a source directory and enqueues files to process."""
-    for src_path in src_dir.rglob("*"):
-        # Skip directories
-        if src_path.is_dir():
-            continue
 
-        # Skip files that are under the destination directory
-        try:
-            src_path.relative_to(destination)
-            if verbose:
-                rel_path = src_path.relative_to(src_dir)
-                logger.info(f"Skipped (in destination): {rel_path}")
-            continue
-        except ValueError:
-            # File is not under destination, proceed normally
-            pass
+    while dirs_left_to_scan.value > 0:
+        if src_dir_queue.empty():
+            continue  # Wait for directories to be added by other producers
+        src_dir = src_dir_queue.get()
+        for src_path in src_dir.sub_source.glob("*"):
+            # Skip directories
+            if src_path.is_dir():
+                src_dir_queue.put(
+                    SourceDirectory(source=src_dir.source, sub_source=src_path)
+                )  # Enqueue subdirectory for further scanning
+                with dirs_left_to_scan.get_lock():
+                    dirs_left_to_scan.value += 1
+                continue
 
-        # Skip files with extensions in skip list
-        if src_path.suffix in skip_extensions:
-            if verbose:
-                rel_path = src_path.relative_to(src_dir)
-                logger.info(f"Skipped (extension filtered): {rel_path}")
-            continue
+            # Skip files that are under the destination directory
+            try:
+                src_path.relative_to(destination)
+                if verbose:
+                    rel_path = src_path.relative_to(src_dir.source)
+                    logger.info(f"Skipped (in destination): {rel_path}")
+                continue
+            except ValueError:
+                # File is not under destination, proceed normally
+                pass
 
-        # Calculate relative path from source root
-        rel_path = src_path.relative_to(src_dir)
-        dst_path = destination / rel_path
+            # Skip files with extensions in skip list
+            if src_path.suffix in skip_extensions:
+                if verbose:
+                    rel_path = src_path.relative_to(src_dir.source)
+                    logger.info(f"Skipped (extension filtered): {rel_path}")
+                continue
 
-        # Skip if destination file already exists
-        if dst_path.exists() or dst_path.is_symlink():
-            if verbose:
-                logger.info(f"Skipped (already exists): {rel_path}")
-            continue
+            # Calculate relative path from source root
+            rel_path = src_path.relative_to(src_dir.source)
 
-        # Enqueue the file for processing
-        queue.put(
-            FileToProcess(
-                src_path=src_path,
-                dst_path=dst_path,
-                rel_path=rel_path,
+            dst_path = destination / rel_path
+
+            # Skip if destination file already exists
+            if dst_path.exists() or dst_path.is_symlink():
+                if verbose:
+                    logger.info(f"Skipped (already exists): {rel_path}")
+                continue
+
+            # Enqueue the file for processing
+            queue.put(
+                FileToProcess(
+                    src_path=src_path,
+                    dst_path=dst_path,
+                    rel_path=rel_path,
+                )
             )
-        )
+        with dirs_left_to_scan.get_lock():
+            dirs_left_to_scan.value -= 1
 
 
 def _consumer(
@@ -137,6 +151,14 @@ def _consumer(
         if result == 1:
             with file_count.get_lock():
                 file_count.value += 1
+
+
+@dataclass(slots=True, frozen=True)
+class SourceDirectory:
+    """Dataclass representing a source directory to be scanned."""
+
+    source: Path
+    sub_source: Path
 
 
 def hardlink_copy_recursive(cfg: Config) -> int:
@@ -168,13 +190,24 @@ def hardlink_copy_recursive(cfg: Config) -> int:
     # Create a shared counter for tracking processed files
     file_count = Value(c_int, 0)
 
+    num_producers = max(1, cfg.workers // 2)
+    num_consumers = max(1, cfg.workers // 2)
+
     # Start producer processes (one per source directory)
     producer_processes: list[Process] = []
+    sources_queue: "Queue[SourceDirectory]" = Queue()
+    dirs_left_to_scan = Value(c_int, 0)
     for src_dir in cfg.sources:
+        sources_queue.put(SourceDirectory(source=src_dir, sub_source=src_dir))
+        with dirs_left_to_scan.get_lock():
+            dirs_left_to_scan.value += 1
+
+    for _ in range(num_producers):
         p = Process(
             target=_producer,
             args=(
-                src_dir,
+                sources_queue,
+                dirs_left_to_scan,
                 cfg.skip_extensions,
                 cfg.destination,
                 cfg.verbose,
@@ -183,9 +216,6 @@ def hardlink_copy_recursive(cfg: Config) -> int:
         )
         p.start()
         producer_processes.append(p)
-
-    # Determine number of consumer processes (half available workers or at least 1)
-    num_consumers = max(1, (cfg.workers or 1) // 2)
 
     # Start consumer processes
     consumer_processes: list[Process] = []
@@ -203,6 +233,18 @@ def hardlink_copy_recursive(cfg: Config) -> int:
 
     # Send sentinel values to signal consumers to stop
     for _ in range(num_consumers):
+        queue.put(None)
+
+    if not queue.empty():
+        for _ in range(num_producers):
+            p = Process(
+                target=_consumer_wrapper,
+                args=(queue, cfg.dry_run, cfg.verbose, cfg.debug, file_count),
+            )
+            p.start()
+            consumer_processes.append(p)
+
+    for _ in range(num_producers):
         queue.put(None)
 
     # Wait for all consumers to finish
@@ -275,6 +317,9 @@ def main():
         format=log_format,
     )
 
+    if args.workers is None:
+        args.workers = os.cpu_count() or 1
+
     # Create global config from CLI arguments
     config = Config(
         sources=args.sources,
@@ -287,6 +332,7 @@ def main():
     )
 
     try:
+        logger.info(f"Using {config.workers} worker(s) for processing")
         file_count = hardlink_copy_recursive(config)
         logger.info(f"Successfully hardlinked {file_count} files")
     except ValueError as e:

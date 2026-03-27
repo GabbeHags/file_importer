@@ -1,3 +1,4 @@
+from multiprocessing.sharedctypes import Synchronized
 import os
 import sys
 import argparse
@@ -72,7 +73,7 @@ def _process_file(
 
 def _producer(
     src_dir_queue: "Queue[SourceDirectory]",
-    dirs_left_to_scan: Value,  # type: ignore
+    dirs_left_to_scan: Synchronized[int],
     skip_extensions: list[str],
     destination: Path,
     verbose: bool,
@@ -124,6 +125,7 @@ def _producer(
                 continue
 
             # Enqueue the file for processing
+            logger.debug(f"Producer enqueuing file: {src_path} -> {dst_path}")
             queue.put(
                 FileToProcess(
                     src_path=src_path,
@@ -140,14 +142,16 @@ def _consumer(
     dry_run: bool,
     verbose: bool,
     debug: bool,
-    file_count,
+    file_count: Synchronized[int],
 ) -> None:
     """Consumer: Dequeues files and hardlinks them. Updates shared file_count."""
     while True:
         file_info = queue.get()
         if file_info is None:  # Sentinel value indicating end of work
             break
+        logger.debug(f"Consumer got file to process: {file_info.src_path}")
         result = _process_file(file_info, dry_run, verbose, debug)
+        logger.debug(f"Consumer finished processing: {file_info.src_path}")
         if result == 1:
             with file_count.get_lock():
                 file_count.value += 1
@@ -228,8 +232,10 @@ def hardlink_copy_recursive(cfg: Config) -> int:
         consumer_processes.append(p)
 
     # Wait for all producers to finish
-    for p in producer_processes:
+    for i, p in enumerate(producer_processes):
+        logger.debug(f"Waiting for producer {i} to finish")
         p.join()
+        logger.debug(f"Producer {i} finished")
 
     # Send sentinel values to signal consumers to stop
     for _ in range(num_consumers):
@@ -248,8 +254,10 @@ def hardlink_copy_recursive(cfg: Config) -> int:
         queue.put(None)
 
     # Wait for all consumers to finish
-    for p in consumer_processes:
+    for i, p in enumerate(consumer_processes):
+        logger.debug(f"Waiting for consumer {i} to finish")
         p.join()
+        logger.debug(f"Consumer {i} finished")
 
     return file_count.value
 

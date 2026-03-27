@@ -73,7 +73,7 @@ def _process_file(
 
 def _producer(
     src_dir_queue: "Queue[SourceDirectory]",
-    dirs_left_to_scan: Synchronized[int],
+    dirs_left_to_scan: "Synchronized[int]",
     skip_extensions: list[str],
     destination: Path,
     verbose: bool,
@@ -142,7 +142,7 @@ def _consumer(
     dry_run: bool,
     verbose: bool,
     debug: bool,
-    file_count: Synchronized[int],
+    file_count: "Synchronized[int]",
 ) -> None:
     """Consumer: Dequeues files and hardlinks them. Updates shared file_count."""
     while True:
@@ -267,7 +267,7 @@ def _consumer_wrapper(
     dry_run: bool,
     verbose: bool,
     debug: bool,
-    file_count,
+    file_count: "Synchronized[int]",
 ) -> None:
     """Wrapper function for consumer process to handle queue communication."""
     _consumer(queue, dry_run, verbose, debug, file_count)

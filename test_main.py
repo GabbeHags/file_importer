@@ -6,6 +6,7 @@ from main import (
     _clean_filename,
     _clean_path,
     Config,
+    CopyStrategy,
     ALLOWED_CHARS,
     hardlink_copy_recursive,
     _create_parser,
@@ -419,7 +420,10 @@ class TestHardlinkIntegration:
         dst_dir = tmp_path / "destination"
 
         config = Config(
-            sources=[src_dir], destination=dst_dir, workers=1, copy_strategy="copy"
+            sources=[src_dir],
+            destination=dst_dir,
+            workers=1,
+            copy_strategy=CopyStrategy.COPY,
         )
         count = hardlink_copy_recursive(config)
 
@@ -451,7 +455,10 @@ class TestHardlinkIntegration:
         dst_dir = tmp_path / "destination"
 
         config = Config(
-            sources=[src_dir], destination=dst_dir, workers=1, copy_strategy="hardlink"
+            sources=[src_dir],
+            destination=dst_dir,
+            workers=1,
+            copy_strategy=CopyStrategy.HARDLINK,
         )
         count = hardlink_copy_recursive(config)
 
@@ -474,7 +481,10 @@ class TestHardlinkIntegration:
         dst_dir = tmp_path / "destination"
 
         config = Config(
-            sources=[src_dir], destination=dst_dir, workers=1, copy_strategy="auto"
+            sources=[src_dir],
+            destination=dst_dir,
+            workers=1,
+            copy_strategy=CopyStrategy.AUTO,
         )
         count = hardlink_copy_recursive(config)
 
@@ -781,7 +791,7 @@ class TestArgumentParsing:
         assert args.workers is None
         assert args.debug is False
         assert args.skip_extensions == []
-        assert args.copy_strategy == "auto"
+        assert args.copy_strategy == "hardlink"
 
     def test_parse_verbose_flag(self, tmp_path):
         """Test parsing with verbose flag."""
@@ -960,7 +970,7 @@ class TestArgumentParsing:
 
         # Test default
         args = self._parse_args([str(src), str(dst)])
-        assert args.copy_strategy == "auto"
+        assert args.copy_strategy == "hardlink"
 
         # Test explicit values
         for strategy in ["auto", "hardlink", "copy"]:
@@ -999,10 +1009,10 @@ class TestArgumentParsing:
             skip_extensions=args.skip_extensions,
             debug=args.debug,
             workers=args.workers or 1,
-            copy_strategy=args.copy_strategy,
+            copy_strategy=CopyStrategy(args.copy_strategy),
         )
 
-        assert config.copy_strategy == "copy"
+        assert config.copy_strategy == CopyStrategy.COPY
         assert config.verbose is True
         assert config.workers == 2
         assert len(config.sources) == 2

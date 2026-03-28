@@ -4,6 +4,7 @@ from queue import Empty
 import argparse
 import logging
 import shutil
+from enum import Enum
 from pathlib import Path
 from multiprocessing import Queue, Process, Value
 
@@ -12,6 +13,15 @@ from ctypes import c_int
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+
+class CopyStrategy(Enum):
+    """Enum for copy strategy options."""
+
+    AUTO = "auto"  # Try hardlink first, fall back to copy on cross-device errors
+    HARDLINK = "hardlink"  # Hardlink only, fail on cross-device
+    COPY = "copy"  # Regular file copy only
+
 
 # Allowed characters for cleaned paths and filenames
 # Keep only: Latin letters, numbers, dots, dashes, underscores, spaces, parentheses, brackets
@@ -65,7 +75,7 @@ class Config:
     dry_run: bool = False
     workers: int = 1
     debug: bool = False
-    copy_strategy: str = "hardlink"  # "auto" (hardlink w/ copy fallback), "hardlink" (only), or "copy" (only)
+    copy_strategy: CopyStrategy = CopyStrategy.HARDLINK
 
     def __post_init__(self):
         """Normalize paths and skip extensions."""
@@ -102,7 +112,7 @@ def _process_file(
     dry_run: bool,
     verbose: bool,
     debug: bool,
-    copy_strategy: str = "auto",
+    copy_strategy: CopyStrategy = CopyStrategy.AUTO,
 ) -> int:
     """Helper function to process a single file for parallel execution."""
     try:
@@ -110,15 +120,15 @@ def _process_file(
             # Ensure parent directory exists
             file_info.dst_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if copy_strategy == "copy":
+            if copy_strategy == CopyStrategy.COPY:
                 # Only copy, never hardlink
                 shutil.copy2(file_info.src_path, file_info.dst_path)
                 link_type = "copied"
-            elif copy_strategy == "hardlink":
+            elif copy_strategy == CopyStrategy.HARDLINK:
                 # Only hardlink, fail on cross-device
                 os.link(file_info.src_path, file_info.dst_path)
                 link_type = "hardlinked"
-            else:  # copy_strategy == "auto"
+            elif copy_strategy == CopyStrategy.AUTO:
                 # Try hardlink first, fall back to copy
                 try:
                     os.link(file_info.src_path, file_info.dst_path)
@@ -129,10 +139,12 @@ def _process_file(
                         link_type = "copied (cross-device)"
                     else:
                         raise
+            else:
+                raise ValueError(f"Invalid copy strategy: {copy_strategy}")
         else:
             link_type = (
-                f"{copy_strategy} (dry-run)"
-                if copy_strategy != "auto"
+                f"{copy_strategy.value} (dry-run)"
+                if copy_strategy != CopyStrategy.AUTO
                 else "hardlinked (dry-run)"
             )
 
@@ -226,7 +238,7 @@ def _consumer(
     verbose: bool,
     debug: bool,
     file_count: "Synchronized[int]",
-    copy_strategy: str = "auto",
+    copy_strategy: CopyStrategy = CopyStrategy.AUTO,
 ) -> None:
     """Consumer: Dequeues files and processes them. Updates shared file_count."""
     while True:
@@ -366,7 +378,7 @@ def _consumer_wrapper(
     verbose: bool,
     debug: bool,
     file_count: "Synchronized[int]",
-    copy_strategy: str = "auto",
+    copy_strategy: CopyStrategy = CopyStrategy.AUTO,
 ) -> None:
     """Wrapper function for consumer process to handle queue communication."""
     _consumer(queue, dry_run, verbose, debug, file_count, copy_strategy)
@@ -410,8 +422,8 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--copy-strategy",
-        choices=["auto", "hardlink", "copy"],
-        default="hardlink",
+        choices=[cs.value for cs in CopyStrategy],
+        default=CopyStrategy.HARDLINK.value,
         help="File copying strategy: auto (hardlink with copy fallback), hardlink (only), or copy (only). Default: hardlink",
     )
     return parser
@@ -448,18 +460,18 @@ def main():
         dry_run=args.dry_run,
         workers=args.workers,
         debug=args.debug,
-        copy_strategy=args.copy_strategy,
+        copy_strategy=CopyStrategy(args.copy_strategy),
     )
 
     try:
         logger.info(f"Using {config.workers} worker(s) for processing")
-        logger.info(f"Using copy strategy: {config.copy_strategy}")
+        logger.info(f"Using copy strategy: {config.copy_strategy.value}")
         file_count = hardlink_copy_recursive(config)
         strategy_name = (
             "hardlinked"
-            if config.copy_strategy == "hardlink"
+            if config.copy_strategy == CopyStrategy.HARDLINK
             else "copied"
-            if config.copy_strategy == "copy"
+            if config.copy_strategy == CopyStrategy.COPY
             else "processed (hardlink or copy)"
         )
         logger.info(f"Successfully {strategy_name} {file_count} files")

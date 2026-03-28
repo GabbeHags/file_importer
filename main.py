@@ -21,13 +21,28 @@ ALLOWED_CHARS = set(
 
 
 def _clean_path(path: Path) -> Path:
-    """Clean path by removing invalid characters from each component."""
+    """Clean path by removing invalid characters from each component.
+
+    Preserves whether the path is absolute or relative.
+    """
+    is_absolute = path.is_absolute()
     parts = []
     for part in path.parts:
+        # Skip empty parts (like '/' on Unix paths)
+        if not part or part == "/":
+            continue
         cleaned = "".join(c for c in part if c in ALLOWED_CHARS)
         if cleaned:
             parts.append(cleaned)
-    return Path(*parts) if parts else path
+
+    if not parts:
+        return path  # Return original if no valid parts
+
+    result = Path(*parts)
+    # Restore absolute path if original was absolute
+    if is_absolute:
+        result = Path("/") / result
+    return result
 
 
 def _clean_filename(filename: str) -> str:
@@ -438,8 +453,16 @@ def main():
 
     try:
         logger.info(f"Using {config.workers} worker(s) for processing")
+        logger.info(f"Using copy strategy: {config.copy_strategy}")
         file_count = hardlink_copy_recursive(config)
-        logger.info(f"Successfully hardlinked {file_count} files")
+        strategy_name = (
+            "hardlinked"
+            if config.copy_strategy == "hardlink"
+            else "copied"
+            if config.copy_strategy == "copy"
+            else "processed (hardlink or copy)"
+        )
+        logger.info(f"Successfully {strategy_name} {file_count} files")
     except ValueError as e:
         if config.debug:
             logger.exception(f"Error: {e}")

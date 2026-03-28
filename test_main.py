@@ -55,8 +55,8 @@ class TestCleanPath:
         """Test that valid path components are preserved."""
         path = Path("/home/user/test-dir_123")
         result = _clean_path(path)
-        # Path separator "/" is removed, so the result is relative
-        assert str(result) == "home/user/test-dir_123"
+        # Absolute path should remain absolute
+        assert str(result) == "/home/user/test-dir_123"
 
     def test_clean_path_removes_special_chars(self):
         """Test that special characters in path components are removed."""
@@ -77,17 +77,52 @@ class TestCleanPath:
         """Test that path structure is maintained."""
         path = Path("/home/user/project/file.txt")
         result = _clean_path(path)
-        # Since "/" is not in ALLOWED_CHARS, the path becomes relative
-        # But the structure (multiple path components) is preserved
-        assert len(result.parts) >= 3  # At least home, user, project
+        # Absolute path should remain absolute and preserve structure
+        assert result.is_absolute()
+        assert len(result.parts) >= 4  # /, home, user, project
 
     def test_clean_path_with_spaces_and_brackets(self):
         """Test that spaces and brackets are preserved."""
         path = Path("/home/user/My Project (v1)/file [2024].txt")
         result = _clean_path(path)
+        # Absolute path should remain absolute
+        assert result.is_absolute()
         path_str = str(result)
         assert "My Project (v1)" in path_str
         assert "file [2024].txt" in path_str
+
+    def test_clean_path_root_path(self):
+        """Test that root path "/" is handled correctly."""
+        path = Path("/")
+        result = _clean_path(path)
+        # Root path "/" has "/" as only part, which is invalid
+        # Should return "/" as-is since no valid parts
+        assert result == path
+
+    def test_clean_path_absolute_path_with_invalid_chars(self):
+        """Test absolute path where root is preserved."""
+        path = Path("/home@invalid/user#test")
+        result = _clean_path(path)
+        # Result should have valid parts and preserve absolute path nature
+        # So it becomes: /homeinvalid/usertest
+        assert str(result) == "/homeinvalid/usertest"
+
+    def test_clean_path_relative_path(self):
+        """Test that relative paths are handled correctly."""
+        path = Path("home/user/test-dir")
+        result = _clean_path(path)
+        # Should remain relative and preserve valid chars
+        assert str(result) == "home/user/test-dir"
+
+    def test_clean_path_relative_with_invalid_chars(self):
+        """Test relative path with invalid characters."""
+        path = Path("home@/user#/test")
+        result = _clean_path(path)
+        # Invalid chars should be removed
+        path_str = str(result)
+        assert "@" not in path_str
+        assert "#" not in path_str
+        assert str(result) == "home/user/test"
 
 
 class TestConfig:

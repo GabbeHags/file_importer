@@ -1,6 +1,7 @@
 """Tests for the file_importer module."""
 
 from pathlib import Path
+from argparse import ArgumentParser
 from main import (
     _clean_filename,
     _clean_path,
@@ -607,3 +608,211 @@ class TestRaceConditions:
         # Count total files created
         total_files = len(list(actual_dst.glob("*.txt")))
         assert total_files == num_files
+
+
+class TestArgumentParsing:
+    """Tests for command-line argument parsing and Config creation."""
+
+    @staticmethod
+    def _parse_args(args_list):
+        """Helper to parse arguments like the CLI does."""
+        parser = ArgumentParser()
+        parser.add_argument("sources", nargs="+")
+        parser.add_argument("destination")
+        parser.add_argument("-v", "--verbose", action="store_true")
+        parser.add_argument("-s", "--skip-extensions", nargs="+", default=[])
+        parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("-j", "--workers", type=int, default=None)
+        parser.add_argument("--debug", action="store_true")
+
+        return parser.parse_args(args_list)
+
+    def test_parse_minimal_args(self, tmp_path):
+        """Test parsing with only required arguments."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        args = self._parse_args([str(src), str(dst)])
+
+        assert args.sources == [str(src)]
+        assert args.destination == str(dst)
+        assert args.verbose is False
+        assert args.dry_run is False
+        assert args.workers is None
+        assert args.debug is False
+        assert args.skip_extensions == []
+
+    def test_parse_verbose_flag(self, tmp_path):
+        """Test parsing with verbose flag."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        args = self._parse_args(["-v", str(src), str(dst)])
+        assert args.verbose is True
+
+        args = self._parse_args(["--verbose", str(src), str(dst)])
+        assert args.verbose is True
+
+    def test_parse_debug_flag(self, tmp_path):
+        """Test parsing with debug flag."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        args = self._parse_args(["--debug", str(src), str(dst)])
+        assert args.debug is True
+
+    def test_parse_dry_run_flag(self, tmp_path):
+        """Test parsing with dry-run flag."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        args = self._parse_args(["--dry-run", str(src), str(dst)])
+        assert args.dry_run is True
+
+    def test_parse_workers_argument(self, tmp_path):
+        """Test parsing with workers argument."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        args = self._parse_args(["-j", "4", str(src), str(dst)])
+        assert args.workers == 4
+
+        args = self._parse_args(["--workers", "8", str(src), str(dst)])
+        assert args.workers == 8
+
+    def test_parse_skip_extensions(self, tmp_path):
+        """Test parsing with skip-extensions."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        # Note: with nargs="+", skip-extensions must come after positional args or use explicit order
+        args = self._parse_args([str(src), str(dst), "-s", "txt", "tmp"])
+        assert "txt" in args.skip_extensions
+        assert "tmp" in args.skip_extensions
+
+        args = self._parse_args(
+            [str(src), str(dst), "--skip-extensions", ".pdf", ".docx"]
+        )
+        assert ".pdf" in args.skip_extensions
+        assert ".docx" in args.skip_extensions
+
+    def test_parse_multiple_sources(self, tmp_path):
+        """Test parsing with multiple source directories."""
+        src1 = tmp_path / "source1"
+        src2 = tmp_path / "source2"
+        dst = tmp_path / "dest"
+        src1.mkdir()
+        src2.mkdir()
+
+        args = self._parse_args([str(src1), str(src2), str(dst)])
+        assert len(args.sources) == 2
+        assert str(src1) in args.sources
+        assert str(src2) in args.sources
+
+    def test_args_to_config_conversion(self, tmp_path):
+        """Test that parsed args are correctly converted to Config."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest@invalid"
+        src.mkdir()
+
+        # Note: positional args must come before optional args with nargs="+"
+        args = self._parse_args(
+            [
+                str(src),
+                str(dst),
+                "-v",
+                "--dry-run",
+                "-j",
+                "2",
+                "--debug",
+                "-s",
+                "tmp",
+                ".bak",
+            ]
+        )
+
+        # Simulate what main() does with the args
+        workers = args.workers or 1
+        config = Config(
+            sources=args.sources,
+            destination=args.destination,
+            verbose=args.verbose or args.debug,
+            skip_extensions=args.skip_extensions,
+            dry_run=args.dry_run,
+            workers=workers,
+            debug=args.debug,
+        )
+
+        assert config.verbose is True  # verbose or debug
+        assert config.dry_run is True
+        assert config.workers == 2
+        assert config.debug is True
+        assert ".tmp" in config.skip_extensions
+        assert ".bak" in config.skip_extensions
+        # Destination should be cleaned
+        assert "@" not in str(config.destination)
+
+    def test_args_workers_defaults_to_one(self, tmp_path):
+        """Test that workers defaults to 1 when None."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        args = self._parse_args([str(src), str(dst)])
+        assert args.workers is None
+
+        # Simulate what main() does
+        workers = args.workers or 1
+        assert workers == 1
+
+    def test_args_verbose_or_debug_sets_verbose(self, tmp_path):
+        """Test that verbose flag is set if debug is true."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        # Test with verbose flag
+        args = self._parse_args(["-v", str(src), str(dst)])
+        verbose = args.verbose or args.debug
+        assert verbose is True
+
+        # Test with debug flag
+        args = self._parse_args(["--debug", str(src), str(dst)])
+        verbose = args.verbose or args.debug
+        assert verbose is True
+
+        # Test with both
+        args = self._parse_args(["-v", "--debug", str(src), str(dst)])
+        verbose = args.verbose or args.debug
+        assert verbose is True
+
+        # Test with neither
+        args = self._parse_args([str(src), str(dst)])
+        verbose = args.verbose or args.debug
+        assert verbose is False
+
+    def test_args_config_with_special_chars_in_paths(self, tmp_path):
+        """Test that args with special characters are handled correctly."""
+        src = tmp_path / "café_source"
+        dst = tmp_path / "dest#invalid"
+        src.mkdir()
+
+        args = self._parse_args([str(src), str(dst)])
+
+        # Create config - destination should be cleaned, source preserved
+        config = Config(
+            sources=args.sources,
+            destination=args.destination,
+            skip_extensions=args.skip_extensions,
+        )
+
+        # Source path preserved (just normalized)
+        assert str(src) in str(config.sources[0])
+        # Destination path cleaned
+        assert "#" not in str(config.destination)

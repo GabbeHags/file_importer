@@ -58,6 +58,13 @@ uv run main.py /path/to/source1 /path/to/source2 /path/to/source3 /path/to/desti
   ```bash
   uv run main.py /src /dst --debug
   ```
+- `--copy-strategy`: File copying strategy (default: hardlink)
+  - `hardlink`: Use hardlinks only, fails if cross-device link not supported
+  - `auto`: Try hardlink first, fall back to copy on cross-device errors (default)
+  - `copy`: Use regular file copy only
+  ```bash
+  uv run main.py /src /dst --copy-strategy hardlink
+  ```
 
 ### Examples
 
@@ -79,4 +86,10 @@ uv run main.py ~/my_project ~/backup --dry-run -v
 
 # Debug mode with full traceback
 uv run main.py ~/my_project ~/backup --debug
+
+# Force regular copy instead of hardlink
+uv run main.py ~/my_project ~/backup --copy-strategy copy
+
+# Use copy fallback for cross-device scenarios
+uv run main.py ~/my_project ~/backup --copy-strategy auto
 ```

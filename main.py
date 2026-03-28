@@ -65,7 +65,7 @@ class Config:
     dry_run: bool = False
     workers: int = 1
     debug: bool = False
-    copy_strategy: str = "auto"  # "auto" (hardlink w/ copy fallback), "hardlink" (only), or "copy" (only)
+    copy_strategy: str = "hardlink"  # "auto" (hardlink w/ copy fallback), "hardlink" (only), or "copy" (only)
 
     def __post_init__(self):
         """Normalize paths and skip extensions."""
@@ -411,8 +411,8 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--copy-strategy",
         choices=["auto", "hardlink", "copy"],
-        default="auto",
-        help="File copying strategy: auto (hardlink with copy fallback), hardlink (only), or copy (only). Default: auto",
+        default="hardlink",
+        help="File copying strategy: auto (hardlink with copy fallback), hardlink (only), or copy (only). Default: hardlink",
     )
     return parser
 

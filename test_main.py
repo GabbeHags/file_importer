@@ -1,13 +1,14 @@
 """Tests for the file_importer module."""
 
+import os
 from pathlib import Path
-from argparse import ArgumentParser
 from main import (
     _clean_filename,
     _clean_path,
     Config,
     ALLOWED_CHARS,
     hardlink_copy_recursive,
+    _create_parser,
 )
 
 
@@ -341,6 +342,117 @@ class TestHardlinkIntegration:
         actual_dst = config.destination
         assert (actual_dst / "test.txt").read_text() == content
 
+    def test_hardlink_creates_actual_hardlinks(self, tmp_path: Path):
+        """Test that files are actually hardlinked (same inode), not copied."""
+        src_dir = tmp_path / "source"
+        src_dir.mkdir()
+        (src_dir / "file.txt").write_text("test content")
+
+        dst_dir = tmp_path / "destination"
+
+        config = Config(sources=[src_dir], destination=dst_dir, workers=1)
+        count = hardlink_copy_recursive(config)
+
+        assert count == 1
+
+        src_file = src_dir / "file.txt"
+        dst_file = config.destination / "file.txt"
+
+        # Verify both files exist
+        assert src_file.exists()
+        assert dst_file.exists()
+
+        # The crucial test: they should have the same inode
+        # This proves they're hardlinked, not just copied
+        src_inode = os.stat(src_file).st_ino
+        dst_inode = os.stat(dst_file).st_ino
+        assert src_inode == dst_inode, (
+            f"Inodes don't match: src={src_inode}, dst={dst_inode}"
+        )
+
+        # Also verify they have the same device
+        src_dev = os.stat(src_file).st_dev
+        dst_dev = os.stat(dst_file).st_dev
+        assert src_dev == dst_dev, "Files are on different devices"
+
+    def test_copy_strategy_copy_creates_separate_files(self, tmp_path: Path):
+        """Test that copy_strategy='copy' creates independent copies (different inodes)."""
+        src_dir = tmp_path / "source"
+        src_dir.mkdir()
+        (src_dir / "file.txt").write_text("test content")
+
+        dst_dir = tmp_path / "destination"
+
+        config = Config(
+            sources=[src_dir], destination=dst_dir, workers=1, copy_strategy="copy"
+        )
+        count = hardlink_copy_recursive(config)
+
+        assert count == 1
+
+        src_file = src_dir / "file.txt"
+        dst_file = config.destination / "file.txt"
+
+        # Verify both files exist
+        assert src_file.exists()
+        assert dst_file.exists()
+
+        # When using copy strategy, inodes should be DIFFERENT
+        src_inode = os.stat(src_file).st_ino
+        dst_inode = os.stat(dst_file).st_ino
+        assert src_inode != dst_inode, (
+            f"Inodes should differ for copies: src={src_inode}, dst={dst_inode}"
+        )
+
+        # Content should be identical though
+        assert src_file.read_text() == dst_file.read_text()
+
+    def test_copy_strategy_hardlink_requires_same_device(self, tmp_path: Path):
+        """Test that copy_strategy='hardlink' works on same device."""
+        src_dir = tmp_path / "source"
+        src_dir.mkdir()
+        (src_dir / "file.txt").write_text("test content")
+
+        dst_dir = tmp_path / "destination"
+
+        config = Config(
+            sources=[src_dir], destination=dst_dir, workers=1, copy_strategy="hardlink"
+        )
+        count = hardlink_copy_recursive(config)
+
+        assert count == 1
+
+        src_file = src_dir / "file.txt"
+        dst_file = config.destination / "file.txt"
+
+        # Should be hardlinked (same inode)
+        src_inode = os.stat(src_file).st_ino
+        dst_inode = os.stat(dst_file).st_ino
+        assert src_inode == dst_inode
+
+    def test_copy_strategy_auto_uses_hardlink_on_same_device(self, tmp_path: Path):
+        """Test that copy_strategy='auto' uses hardlink when on same device."""
+        src_dir = tmp_path / "source"
+        src_dir.mkdir()
+        (src_dir / "file.txt").write_text("test content")
+
+        dst_dir = tmp_path / "destination"
+
+        config = Config(
+            sources=[src_dir], destination=dst_dir, workers=1, copy_strategy="auto"
+        )
+        count = hardlink_copy_recursive(config)
+
+        assert count == 1
+
+        src_file = src_dir / "file.txt"
+        dst_file = config.destination / "file.txt"
+
+        # Auto should prefer hardlink when it works
+        src_inode = os.stat(src_file).st_ino
+        dst_inode = os.stat(dst_file).st_ino
+        assert src_inode == dst_inode
+
     def test_hardlink_skip_existing_files(self, tmp_path: Path):
         """Test that existing files in destination are skipped."""
         src_dir = tmp_path / "source"
@@ -615,16 +727,8 @@ class TestArgumentParsing:
 
     @staticmethod
     def _parse_args(args_list):
-        """Helper to parse arguments like the CLI does."""
-        parser = ArgumentParser()
-        parser.add_argument("sources", nargs="+")
-        parser.add_argument("destination")
-        parser.add_argument("-v", "--verbose", action="store_true")
-        parser.add_argument("-s", "--skip-extensions", nargs="+", default=[])
-        parser.add_argument("--dry-run", action="store_true")
-        parser.add_argument("-j", "--workers", type=int, default=None)
-        parser.add_argument("--debug", action="store_true")
-
+        """Helper to parse arguments using the real CLI parser."""
+        parser = _create_parser()
         return parser.parse_args(args_list)
 
     def test_parse_minimal_args(self, tmp_path):
@@ -642,6 +746,7 @@ class TestArgumentParsing:
         assert args.workers is None
         assert args.debug is False
         assert args.skip_extensions == []
+        assert args.copy_strategy == "auto"
 
     def test_parse_verbose_flag(self, tmp_path):
         """Test parsing with verbose flag."""
@@ -767,35 +872,30 @@ class TestArgumentParsing:
         args = self._parse_args([str(src), str(dst)])
         assert args.workers is None
 
-        # Simulate what main() does
-        workers = args.workers or 1
-        assert workers == 1
+        # Verify config creation respects the default
+        config = Config(
+            sources=args.sources,
+            destination=args.destination,
+            workers=args.workers or 1,
+        )
+        assert config.workers == 1
 
-    def test_args_verbose_or_debug_sets_verbose(self, tmp_path):
-        """Test that verbose flag is set if debug is true."""
+    def test_config_verbose_when_debug_enabled(self, tmp_path):
+        """Test that Config.verbose is set when debug is enabled."""
         src = tmp_path / "source"
         dst = tmp_path / "dest"
         src.mkdir()
 
-        # Test with verbose flag
-        args = self._parse_args(["-v", str(src), str(dst)])
-        verbose = args.verbose or args.debug
-        assert verbose is True
-
-        # Test with debug flag
+        # Config should have verbose=True when debug is enabled
         args = self._parse_args(["--debug", str(src), str(dst)])
-        verbose = args.verbose or args.debug
-        assert verbose is True
-
-        # Test with both
-        args = self._parse_args(["-v", "--debug", str(src), str(dst)])
-        verbose = args.verbose or args.debug
-        assert verbose is True
-
-        # Test with neither
-        args = self._parse_args([str(src), str(dst)])
-        verbose = args.verbose or args.debug
-        assert verbose is False
+        config = Config(
+            sources=args.sources,
+            destination=args.destination,
+            verbose=args.verbose or args.debug,
+            debug=args.debug,
+        )
+        assert config.verbose is True
+        assert config.debug is True
 
     def test_args_config_with_special_chars_in_paths(self, tmp_path):
         """Test that args with special characters are handled correctly."""
@@ -816,3 +916,58 @@ class TestArgumentParsing:
         assert str(src) in str(config.sources[0])
         # Destination path cleaned
         assert "#" not in str(config.destination)
+
+    def test_parse_copy_strategy(self, tmp_path):
+        """Test parsing for all copy-strategy values (default and explicit)."""
+        src = tmp_path / "source"
+        dst = tmp_path / "dest"
+        src.mkdir()
+
+        # Test default
+        args = self._parse_args([str(src), str(dst)])
+        assert args.copy_strategy == "auto"
+
+        # Test explicit values
+        for strategy in ["auto", "hardlink", "copy"]:
+            args = self._parse_args([str(src), str(dst), "--copy-strategy", strategy])
+            assert args.copy_strategy == strategy
+
+    def test_copy_strategy_with_other_args(self, tmp_path):
+        """Test copy_strategy works with other arguments."""
+        src1 = tmp_path / "source1"
+        src2 = tmp_path / "source2"
+        dst = tmp_path / "dest"
+        src1.mkdir()
+        src2.mkdir()
+
+        args = self._parse_args(
+            [
+                str(src1),
+                str(src2),
+                str(dst),
+                "-v",
+                "--debug",
+                "-j",
+                "2",
+                "--copy-strategy",
+                "copy",
+                "-s",
+                "tmp",
+                "bak",
+            ]
+        )
+
+        config = Config(
+            sources=args.sources,
+            destination=args.destination,
+            verbose=args.verbose or args.debug,
+            skip_extensions=args.skip_extensions,
+            debug=args.debug,
+            workers=args.workers or 1,
+            copy_strategy=args.copy_strategy,
+        )
+
+        assert config.copy_strategy == "copy"
+        assert config.verbose is True
+        assert config.workers == 2
+        assert len(config.sources) == 2

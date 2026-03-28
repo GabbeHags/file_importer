@@ -1,9 +1,9 @@
 from multiprocessing.sharedctypes import Synchronized
 import os
 from queue import Empty
-import sys
 import argparse
 import logging
+import shutil
 from pathlib import Path
 from multiprocessing import Queue, Process, Value
 
@@ -50,6 +50,7 @@ class Config:
     dry_run: bool = False
     workers: int = 1
     debug: bool = False
+    copy_strategy: str = "auto"  # "auto" (hardlink w/ copy fallback), "hardlink" (only), or "copy" (only)
 
     def __post_init__(self):
         """Normalize paths and skip extensions."""
@@ -82,22 +83,52 @@ class FileToProcess:
 
 
 def _process_file(
-    file_info: FileToProcess, dry_run: bool, verbose: bool, debug: bool
+    file_info: FileToProcess,
+    dry_run: bool,
+    verbose: bool,
+    debug: bool,
+    copy_strategy: str = "auto",
 ) -> int:
     """Helper function to process a single file for parallel execution."""
     try:
         if not dry_run:
             # Ensure parent directory exists
             file_info.dst_path.parent.mkdir(parents=True, exist_ok=True)
-            os.link(file_info.src_path, file_info.dst_path)
+
+            if copy_strategy == "copy":
+                # Only copy, never hardlink
+                shutil.copy2(file_info.src_path, file_info.dst_path)
+                link_type = "copied"
+            elif copy_strategy == "hardlink":
+                # Only hardlink, fail on cross-device
+                os.link(file_info.src_path, file_info.dst_path)
+                link_type = "hardlinked"
+            else:  # copy_strategy == "auto"
+                # Try hardlink first, fall back to copy
+                try:
+                    os.link(file_info.src_path, file_info.dst_path)
+                    link_type = "hardlinked"
+                except OSError as e:
+                    if e.errno == 18:  # EXDEV: Invalid cross-device link
+                        shutil.copy2(file_info.src_path, file_info.dst_path)
+                        link_type = "copied (cross-device)"
+                    else:
+                        raise
+        else:
+            link_type = (
+                f"{copy_strategy} (dry-run)"
+                if copy_strategy != "auto"
+                else "hardlinked (dry-run)"
+            )
+
         if verbose:
-            logger.info(f"Hardlinked: {file_info.rel_path}")
+            logger.info(f"{link_type.capitalize()}: {file_info.rel_path}")
         return 1
     except OSError as e:
         if debug:
-            logger.exception(f"Error hardlinking {file_info.rel_path}")
+            logger.exception(f"Error processing {file_info.rel_path}")
         else:
-            logger.error(f"Error hardlinking {file_info.rel_path}: {e}")
+            logger.error(f"Error processing {file_info.rel_path}: {e}")
         return 0
 
 
@@ -180,14 +211,15 @@ def _consumer(
     verbose: bool,
     debug: bool,
     file_count: "Synchronized[int]",
+    copy_strategy: str = "auto",
 ) -> None:
-    """Consumer: Dequeues files and hardlinks them. Updates shared file_count."""
+    """Consumer: Dequeues files and processes them. Updates shared file_count."""
     while True:
         file_info = queue.get()
         if file_info is None:  # Sentinel value indicating end of work
             break
         logger.debug(f"Consumer got file to process: {file_info.src_path}")
-        result = _process_file(file_info, dry_run, verbose, debug)
+        result = _process_file(file_info, dry_run, verbose, debug, copy_strategy)
         logger.debug(f"Consumer finished processing: {file_info.src_path}")
         if result == 1:
             with file_count.get_lock():
@@ -263,7 +295,14 @@ def hardlink_copy_recursive(cfg: Config) -> int:
     for _ in range(num_consumers):
         p = Process(
             target=_consumer_wrapper,
-            args=(queue, cfg.dry_run, cfg.verbose, cfg.debug, file_count),
+            args=(
+                queue,
+                cfg.dry_run,
+                cfg.verbose,
+                cfg.debug,
+                file_count,
+                cfg.copy_strategy,
+            ),
         )
         p.start()
         consumer_processes.append(p)
@@ -282,7 +321,14 @@ def hardlink_copy_recursive(cfg: Config) -> int:
         for _ in range(num_producers):
             p = Process(
                 target=_consumer_wrapper,
-                args=(queue, cfg.dry_run, cfg.verbose, cfg.debug, file_count),
+                args=(
+                    queue,
+                    cfg.dry_run,
+                    cfg.verbose,
+                    cfg.debug,
+                    file_count,
+                    cfg.copy_strategy,
+                ),
             )
             p.start()
             consumer_processes.append(p)
@@ -305,14 +351,14 @@ def _consumer_wrapper(
     verbose: bool,
     debug: bool,
     file_count: "Synchronized[int]",
+    copy_strategy: str = "auto",
 ) -> None:
     """Wrapper function for consumer process to handle queue communication."""
-    _consumer(queue, dry_run, verbose, debug, file_count)
+    _consumer(queue, dry_run, verbose, debug, file_count, copy_strategy)
 
 
-def main():
-    global config
-
+def _create_parser() -> argparse.ArgumentParser:
+    """Create and return the argument parser."""
     parser = argparse.ArgumentParser(
         description="Recursively hardlink copy all files from one or more source directories to a destination, preserving paths."
     )
@@ -347,6 +393,19 @@ def main():
         action="store_true",
         help="Show full traceback on errors",
     )
+    parser.add_argument(
+        "--copy-strategy",
+        choices=["auto", "hardlink", "copy"],
+        default="auto",
+        help="File copying strategy: auto (hardlink with copy fallback), hardlink (only), or copy (only). Default: auto",
+    )
+    return parser
+
+
+def main():
+    global config
+
+    parser = _create_parser()
 
     args = parser.parse_args()
 
@@ -374,6 +433,7 @@ def main():
         dry_run=args.dry_run,
         workers=args.workers,
         debug=args.debug,
+        copy_strategy=args.copy_strategy,
     )
 
     try:

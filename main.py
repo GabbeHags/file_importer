@@ -1,5 +1,6 @@
 from multiprocessing.sharedctypes import Synchronized
 import os
+from queue import Empty
 import sys
 import argparse
 import logging
@@ -11,6 +12,31 @@ from ctypes import c_int
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+# Allowed characters for cleaned paths and filenames
+# Keep only: Latin letters, numbers, dots, dashes, underscores, spaces, parentheses, brackets
+ALLOWED_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- ()[]{}"
+)
+
+
+def _clean_path(path: Path) -> Path:
+    """Clean path by removing invalid characters from each component."""
+    parts = []
+    for part in path.parts:
+        cleaned = "".join(c for c in part if c in ALLOWED_CHARS)
+        if cleaned:
+            parts.append(cleaned)
+    return Path(*parts) if parts else path
+
+
+def _clean_filename(filename: str) -> str:
+    """Remove non-standard characters from filename.
+
+    Keep only: Latin letters, numbers, dots, dashes, underscores, spaces, parentheses, brackets.
+    """
+    cleaned = "".join(c for c in filename if c in ALLOWED_CHARS)
+    return cleaned if cleaned else filename  # Return original if nothing valid remains
 
 
 @dataclass(frozen=True)
@@ -27,10 +53,14 @@ class Config:
 
     def __post_init__(self):
         """Normalize paths and skip extensions."""
-        # Normalize sources list
+        # Normalize sources list (keep original names with glyphs)
         normalized_sources = [Path(src).resolve() for src in self.sources]
+
+        # Clean destination path only
+        cleaned_destination = _clean_path(Path(self.destination).resolve())
+
         object.__setattr__(self, "sources", normalized_sources)
-        object.__setattr__(self, "destination", Path(self.destination).resolve())
+        object.__setattr__(self, "destination", cleaned_destination)
         # Ensure extensions start with a dot
         skip_exts = [
             ext if ext.startswith(".") else f".{ext}" for ext in self.skip_extensions
@@ -82,9 +112,13 @@ def _producer(
     """Producer: Scans a source directory and enqueues files to process."""
 
     while dirs_left_to_scan.value > 0:
-        if src_dir_queue.empty():
-            continue  # Wait for directories to be added by other producers
-        src_dir = src_dir_queue.get()
+        try:
+            # Use timeout to avoid blocking indefinitely if queue is empty
+            src_dir: SourceDirectory = src_dir_queue.get(timeout=0.1)
+        except Empty:
+            # Queue timeout, check if there's more work to do and continue
+            continue
+
         for src_path in src_dir.sub_source.glob("*"):
             # Skip directories
             if src_path.is_dir():
@@ -113,15 +147,18 @@ def _producer(
                     logger.info(f"Skipped (extension filtered): {rel_path}")
                 continue
 
-            # Calculate relative path from source root
+            # Calculate relative path from source root (keep source names with glyphs)
             rel_path = src_path.relative_to(src_dir.source)
+            # Clean each component of the relative path for destination only
+            cleaned_rel_parts = [_clean_filename(part) for part in rel_path.parts]
+            cleaned_rel_path = Path(*cleaned_rel_parts)
 
-            dst_path = destination / rel_path
+            dst_path = destination / cleaned_rel_path
 
             # Skip if destination file already exists
             if dst_path.exists() or dst_path.is_symlink():
                 if verbose:
-                    logger.info(f"Skipped (already exists): {rel_path}")
+                    logger.info(f"Skipped (already exists): {cleaned_rel_path}")
                 continue
 
             # Enqueue the file for processing
@@ -130,7 +167,7 @@ def _producer(
                 FileToProcess(
                     src_path=src_path,
                     dst_path=dst_path,
-                    rel_path=rel_path,
+                    rel_path=cleaned_rel_path,
                 )
             )
         with dirs_left_to_scan.get_lock():
@@ -348,13 +385,13 @@ def main():
             logger.exception(f"Error: {e}")
         else:
             logger.error(f"Error: {e}")
-        sys.exit(1)
+        return 1
     except Exception as e:
         if config.debug:
             logger.exception(f"Unexpected error: {e}")
         else:
             logger.error(f"Unexpected error: {e}")
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":

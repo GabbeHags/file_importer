@@ -533,6 +533,49 @@ class TestHardlinkIntegration:
         # @ should be removed, but other valid chars preserved
         assert (actual_dst / "my-file_2024[v1]final.txt").exists()
 
+    def test_single_worker_vs_multiple_workers_equal_results(self, tmp_path: Path):
+        """Test that single-worker and multi-worker configurations produce identical results."""
+        # Create source with various files and subdirectories
+        src_dir = tmp_path / "source"
+        src_dir.mkdir()
+        (src_dir / "file1.txt").write_text("content1")
+        (src_dir / "file2.txt").write_text("content2")
+
+        subdir = src_dir / "subdir"
+        subdir.mkdir()
+        (subdir / "nested1.txt").write_text("nested1")
+        (subdir / "nested2.txt").write_text("nested2")
+
+        subdir2 = subdir / "deep"
+        subdir2.mkdir()
+        (subdir2 / "deep.txt").write_text("deep content")
+
+        # Run with single worker
+        dst_single = tmp_path / "dst_single"
+        config_single = Config(sources=[src_dir], destination=dst_single, workers=1)
+        count_single = hardlink_copy_recursive(config_single)
+
+        # Run with multiple workers
+        dst_multi = tmp_path / "dst_multi"
+        config_multi = Config(sources=[src_dir], destination=dst_multi, workers=4)
+        count_multi = hardlink_copy_recursive(config_multi)
+
+        # Compare file counts
+        assert count_single == count_multi == 5
+
+        # Compare directory structures
+        single_files = set(sorted(dst_single.rglob("*")))
+        multi_files = set(sorted(dst_multi.rglob("*")))
+
+        assert len(single_files) == len(multi_files)
+
+        # Compare file contents
+        for file_path in dst_single.rglob("*.txt"):
+            rel_path = file_path.relative_to(dst_single)
+            multi_file = dst_multi / rel_path
+            assert multi_file.exists()
+            assert file_path.read_text() == multi_file.read_text()
+
 
 class TestRaceConditions:
     """Tests for race conditions with multiple workers."""
@@ -745,7 +788,7 @@ class TestRaceConditions:
         dst_dir = tmp_path / "destination"
 
         # Use multiple workers for performance
-        config = Config(sources=[src_dir], destination=dst_dir, workers=4)
+        config = Config(sources=[src_dir], destination=dst_dir, workers=16)
         count = hardlink_copy_recursive(config)
 
         assert count == num_files
@@ -788,7 +831,7 @@ class TestArgumentParsing:
         assert args.destination == str(dst)
         assert args.verbose is False
         assert args.dry_run is False
-        assert args.workers is None
+        assert args.workers == os.cpu_count() or 1
         assert args.debug is False
         assert args.skip_extensions == []
         assert args.copy_strategy == "hardlink"
@@ -915,15 +958,15 @@ class TestArgumentParsing:
         src.mkdir()
 
         args = self._parse_args([str(src), str(dst)])
-        assert args.workers is None
+        assert args.workers == os.cpu_count() or 1
 
         # Verify config creation respects the default
         config = Config(
             sources=args.sources,
             destination=args.destination,
-            workers=args.workers or 1,
+            workers=args.workers,
         )
-        assert config.workers == 1
+        assert config.workers == os.cpu_count() or 1
 
     def test_config_verbose_when_debug_enabled(self, tmp_path):
         """Test that Config.verbose is set when debug is enabled."""

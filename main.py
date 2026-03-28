@@ -93,6 +93,9 @@ class Config:
         ]
         object.__setattr__(self, "skip_extensions", skip_exts)
 
+        if self.workers < 1:
+            raise ValueError("Workers must be a positive integer")
+
 
 # Global config instance
 config: Config | None = None
@@ -290,8 +293,12 @@ def hardlink_copy_recursive(cfg: Config) -> int:
     # Create a shared counter for tracking processed files
     file_count = Value(c_int, 0)
 
-    num_producers = max(1, cfg.workers // 2)
-    num_consumers = max(1, cfg.workers // 2)
+    if cfg.workers == 1:
+        num_producers = 1
+        num_consumers = 0
+    else:
+        num_producers = max(1, cfg.workers // 2)
+        num_consumers = max(1, cfg.workers // 2)
 
     # Start producer processes (one per source directory)
     producer_processes: list[Process] = []
@@ -412,7 +419,7 @@ def _create_parser() -> argparse.ArgumentParser:
         "-j",
         "--workers",
         type=int,
-        default=None,
+        default=os.cpu_count() or 1,
         help="Number of parallel workers (default: CPU count)",
     )
     parser.add_argument(
@@ -447,9 +454,6 @@ def main():
         level=log_level,
         format=log_format,
     )
-
-    if args.workers is None:
-        args.workers = os.cpu_count() or 1
 
     # Create global config from CLI arguments
     config = Config(
